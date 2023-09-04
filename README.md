@@ -11,8 +11,19 @@ The dataset employed in this endeavor is sourced from the Framingham Heart Study
 
 The initial phase of the project involves data preprocessing, which encompasses addressing missing data, encoding categorical variables, and normalizing numerical data. Following preprocessing, the dataset undergoes a division into training and testing subsets, employing a 80:20 ratio.
 
-Diverse machine learning algorithms are subsequently applied to the training data, including logistic regression, K-nearest neighbors (KNN), XGBoost, Support Vector Classifier (SVC), random forest, and the Naive Bayes Classifier. These algorithms were selected due to their documented efficacy in cardiovascular risk prediction. The models are trained using the training data, and their performance is meticulously assessed using the testing data."
+Diverse machine learning algorithms are subsequently applied to the training data, including logistic regression, K-nearest neighbors (KNN), XGBoost, Support Vector Classifier (SVC), random forest, and the Naive Bayes Classifier. These algorithms were selected due to their documented efficacy in cardiovascular risk prediction. The models are trained using the training data, and their performance is meticulously assessed using the testing data.
 
+# Evaluation Metrics
+The evaluation metrics used in this project include Accuracy, Precision, Recall, and the area under the receiver operating characteristic curve (AUC-ROC). These metrics help in assessing the performance of the machine learning model.
+
+# Results
+The results show that XGBoost performs the best among the tested algorithms, with an accuracy of 0.89, precision of 0.92, recall of 0.85, and AUC-ROC of 0.89. This indicates that the model has a good overall performance in predicting cardiovascular risk.
+
+# Feature Importance
+Further analysis is performed to identify the most important features in the dataset. The feature importance plot shows that age, education, prevalentHyp, and cigarettes per day are the top important features in predicting cardiovascular risk. This information can help in identifying high-risk individuals and implementing preventive measures.
+
+# Conclusion
+In conclusion, this project demonstrates the effectiveness of machine learning techniques in predicting cardiovascular risk using the Framingham Heart Study dataset. The developed machine learning model can be used by healthcare professionals to identify individuals at high risk of cardiovascular disease and take preventive measures to reduce the risk. Early prediction of cardiovascular risk can contribute to timely intervention and improve patient outcomes.
 
 
 
