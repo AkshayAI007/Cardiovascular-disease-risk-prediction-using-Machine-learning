@@ -1,4 +1,6 @@
-[Alma Better Certified Project ]([https://www.google.com](https://certificates.almabetter.com/en/verify/59339199510061))
+# Alma Better Certified Project
+![image](https://github.com/AkshayAI007/Cardiovascular-disease-risk-prediction-using-Machine-learning/assets/110448324/bbc95507-8fca-4d59-b4f6-248d8c5f2713)
+
 
 
 # Cardiovascular-disease-risk-prediction-using-Machine-learning
