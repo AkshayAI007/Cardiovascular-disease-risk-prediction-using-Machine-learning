@@ -1,7 +1,7 @@
 # ML Implementation Audit: Cardiovascular (10-year CHD) Risk Prediction
 
 **Audited commit:** `3a9ce96` · **Scope:** data, preprocessing, modelling, evaluation, inference/serving
-**Method:** code review, plus re-running the training pipeline in isolation, probing the shipped model bundle, the FastAPI app and the CLI, and running controlled ablations. Every number below comes from the scripts in this folder (see [Reproducing](#9-reproducing-this-audit)).
+**Method:** code review, plus re-running the training pipeline in isolation, probing the shipped model bundle, the FastAPI app and the CLI, and running controlled ablations. Every number below comes from the scripts in this folder (see [Reproducing](#10-reproducing-this-audit)).
 
 ---
 
@@ -20,7 +20,9 @@ The `src/` refactor fixes the notebook's main leak: scaling and SMOTE no longer 
 | 5 | The test set is used for model selection | The reported "best model" metrics are optimistically biased. |
 | 6 | The CLI and the UI give wrong results | `--sex M` crashes and `--sex 1` scores a male as female. The web UI silently shows a hard-coded formula whenever the API fails. |
 
-Aggregate AUC (~0.71) hides all of this. The destroyed features are rare (22–100 patients each), so the overall score barely changes. The damage shows up in the highest-risk patients:
+**Leakage check (§4).** The split does happen first, and every preprocessing statistic (imputer, IQR fences, feature selector, scaler, SMOTE) is fitted on the 2,034 training rows only. This was verified by tracing every fit call and by perturbing the val/test rows. The leaks come *after* preprocessing, in `src/train.py`: SMOTE before CV, model selection on the test set, stacking trained on the validation set, and a CV report that includes test rows. The original notebook fails the split-first rule outright: its XGBoost score of ~0.89 accuracy / 0.95 AUC drops to 0.85 / 0.63 when the split comes first.
+
+Aggregate AUC (~0.71) hides the feature defects. The destroyed features are rare (22–100 patients each), so the overall score barely changes. The damage shows up in the highest-risk patients:
 
 | Subgroup (whole dataset) | n | Observed CHD rate | Shipped model mean prediction |
 |---|---:|---:|---:|
@@ -36,7 +38,7 @@ These figures are partly in-sample, which flatters the model. The highest probab
 
 ## 1. What is done well
 
-- Imputation, clipping, feature selection and scaling statistics are fitted on the training split only and reused at inference (`preprocessing.py`).
+- The data is split into train/val/test first, and imputation, clipping, feature selection, scaling and SMOTE are fitted on the training split only, then reused at inference (`preprocessing.py`). Verified in §4.
 - Splits are stratified. The threshold for the base models is tuned on a validation set, not the test set.
 - Probability calibration and decision-curve analysis are attempted. Clinical metrics (sensitivity, specificity, PPV, NPV) are reported.
 - Preprocessing parameters are serialised with the model. The API uses Pydantic validation and has a health endpoint.
@@ -145,9 +147,9 @@ Four separate problems:
    | KNN | SMOTE inside CV | 0.666 | 0.654 | 0.012 | `k=51, uniform` |
    | KNN | No resampling | 0.676 | **0.710** | −0.034 | `k=51, distance` |
 
-   The flexible models consistently picked the high-capacity end of their grids: unlimited or deepest trees, the most estimators, the largest `C`, distance-weighted neighbours. The tree models are not weak on this data: with honest CV, a shallow regularised XGBoost scores **0.713** and RandomForest (min_leaf=20) **0.712** (§5.1).
+   The flexible models consistently picked the high-capacity end of their grids: unlimited or deepest trees, the most estimators, the largest `C`, distance-weighted neighbours. The tree models are not weak on this data: with honest CV, a shallow regularised XGBoost scores **0.713** and RandomForest (min_leaf=20) **0.712** (§6.1).
 2. **SMOTE interpolates binary columns.** 13.6% of synthetic `sex_M` values and 7.9% of `prevalentHyp` values are fractional. Mixed data needs `SMOTENC`, if oversampling is used at all.
-3. **It shifts predicted probabilities by about +0.29** (mean predicted minus observed; see §5). Platt scaling has to undo this afterwards.
+3. **It shifts predicted probabilities by about +0.29** (mean predicted minus observed; see §6). Platt scaling has to undo this afterwards.
 4. **It gives no discrimination benefit.** LR AUC is 0.721 without resampling vs 0.718 with SMOTE inside the pipeline.
 
 **Should be:** no resampling. Train at the natural prevalence and handle the cost asymmetry with the decision threshold. If resampling is kept, put it inside an `imblearn.pipeline.Pipeline` so it runs within each CV training fold, and recalibrate afterwards.
@@ -168,7 +170,90 @@ Four separate problems:
 
 ---
 
-## 4. Modelling, selection and evaluation
+## 4. Data-leakage check: split first, fit on train only
+
+**Question:** is the data split into train / validation / test *before* any preprocessing, and is every preprocessing statistic learned from the training rows only?
+
+**Answer:** yes for the preprocessing in `src/preprocessing.py`. No for what `src/train.py` does with the validation and test sets afterwards. No for the original notebook.
+
+Evidence comes from `06_leakage_check.py`, which instruments `preprocess_train()` to record exactly which rows each fitted step receives, then re-runs it with the val/test rows deliberately corrupted.
+
+### 4.1 Preprocessing (`src/preprocessing.py`): passes
+
+| Check | Result | Evidence |
+|---|---|---|
+| Split before any fitting | ✅ PASS | Call trace: `split(3390 rows)` → `split(2712)` → `fit_imputer` → `fit_statistical_transforms` → `fit_scaler` → `apply_smote` |
+| Each fitted step sees only training rows | ✅ PASS | Each received exactly **2,034 train / 0 val / 0 test** rows |
+| Fitted state independent of val/test | ✅ PASS | Rescaling every numeric val/test value by ×0.2–5, flipping `sex` and blanking glucose leaves the imputer values, IQR fences, kept columns, scaler mean/scale and the SMOTE'd training matrix **bit-identical**. The same corruption applied to *train* rows does change them, so the test is sensitive. |
+| Val/test are transformed, never refitted | ✅ PASS | Corrupted val rows come out different, using the stored training statistics |
+| Inference reuses stored statistics only | ✅ PASS | `preprocess_inference()` has no fit calls |
+| Splits disjoint and stratified | ✅ PASS | 2,034 / 678 / 678 rows; positive rate 15.1% / 15.0% / 15.0%; 0 identical feature rows shared across splits |
+| No target leakage | ✅ PASS | `TenYearCHD` is not in the feature matrix. The strongest single feature is `sysBP` (AUC 0.685 on train), so no feature is a proxy for the label. |
+
+Per step:
+
+| Step | Learns statistics? | Fitted on | Applied to val/test as | Verdict |
+|---|---|---|---|---|
+| Stratified split 60/20/20 | — | — | — | ✅ first operation |
+| Median/mode imputation | yes | train only | transform | ✅ |
+| One-hot encoding (`sex`, `is_smoking`) | no | — (per split) | per split | ✅ no leak; consistency risk (P3) |
+| Pulse pressure, age bins, BMI flags, `log1p` | no | — | per split | ✅ |
+| IQR fences | yes | train only | transform | ✅ no leak, but applied to the wrong columns (P6) |
+| Variance/correlation selector | yes | train only | transform | ✅ no leak, but harmful (P7) |
+| `StandardScaler` | yes | train only | transform | ✅ |
+| SMOTE | yes | train only | not applied | ✅ |
+
+So the preprocessing problems in §3 are about *what* the transforms do, not *where* they are fitted.
+
+### 4.2 After preprocessing (`src/train.py`): fails
+
+| # | How val/test data leaks into a decision | Code | Measured effect | Severity |
+|---|---|---|---|---|
+| L1 | The SMOTE'd training set is fed to `GridSearchCV`. Synthetic rows interpolated from patients in one fold land in the other folds. | `train.py:63` → `models.tune_model` | XGBoost CV AUC **0.960** vs test **0.612** | High |
+| L2 | The best model is picked by **test** AUC, and the stacking members are the top 3 by **test** AUC | `train.py:108-112, 147-151, 200` | Across 1,000 bootstrap resamples of the test set the "winner" changes: LR 48%, Stacking 34%, NaiveBayes 17%. The pick is noise, and the winner's test score is a maximum over candidates, so it is optimistic. | High |
+| L3 | Stacking is trained on train **+ val**, then its threshold is tuned on val | `train.py:118-128` | AUC on val (seen during training) 0.725 vs test 0.713 | High |
+| L4 | The saved "cross-validation" report runs on SMOTE'd train + val + **test** | `train.py:209-211` | 4,810 rows: **30% synthetic, 14% test**; 40% positive vs a real 15% | High (reporting) |
+| L5 | Platt calibration and the re-tuned threshold are both fitted on the same val rows | `train.py:228-232` | The test set stays clean, but the threshold is fitted to calibration noise on 102 positives | Medium |
+| L6 | `learning_curve()` runs on the SMOTE'd training set | `train.py:247` | Same mechanism as L1 | Medium |
+| L7 | Preprocessing is fitted once on all training rows, then reused inside the `GridSearchCV` folds instead of being refitted per fold | `preprocess_train` → `tune_model` | CV AUC 0.7234 vs 0.7233 refitted per fold, **negligible here** | Low; still fix it by putting preprocessing in a `Pipeline` |
+| L8 | EDA plots and feature decisions (log columns, pulse pressure) were made on the full dataset | `train.py:run_eda`, notebook | Not measurable; a researcher-choice leak | Low |
+
+### 4.3 The original notebook: fails the split-first rule
+
+The notebook imputes, scales and applies SMOTE to the **whole** dataset, then splits. Reproduced with its feature set:
+
+| Order | Model | Test AUC | Test accuracy | Synthetic rows in "test" |
+|---|---|---:|---:|---:|
+| N0 Notebook: impute + scale + SMOTE on all rows, then split | XGBoost | **0.954** | **0.892** | 40% |
+| N0 Notebook | LogReg | 0.734 | 0.675 | 40% |
+| N1 Impute + scale on all rows, split, SMOTE on train only | XGBoost | 0.640 | 0.822 | 0% |
+| N1 | LogReg | 0.737 | 0.692 | 0% |
+| **N2 Split first, everything fitted on train (correct)** | XGBoost | 0.634 | 0.850 | 0% |
+| **N2** | LogReg | 0.736 | 0.853 | 0% |
+
+- **N0 reproduces the notebook's headline number** (XGBoost ≈ 0.89 test accuracy, and ASSESSMENT.md's "XGBoost ROC AUC ~0.90"). 40% of the "test" patients are synthetic blends of training patients, so a depth-7 XGBoost scores well by recognising them. Split first, the same model gets AUC **0.634** and accuracy **0.850**, which is no better than predicting "no CHD" for everyone (0.849).
+- **N1 vs N2:** fitting the imputer and scaler before the split moves AUC by less than 0.01 here. Almost all of the notebook's inflation comes from applying SMOTE before the split. Fitting on train only still matters: it makes the test honest by construction rather than by luck.
+- Logistic regression barely changes under N0 because a linear model can't memorise synthetic neighbours. Flexible models can, which is why the leak mainly shows up in the tree-model results.
+
+### 4.4 The correct order
+
+```
+raw data
+ └─ 1. split FIRST: development (80%) / test (20%), stratified      ← test set locked away
+ └─ 2. on development data only: K-fold CV
+        each fold: fit  impute → encode → scale → (resample) → model   on the fold's train part
+                   apply (transform only)                              to the fold's validation part
+        → choose model, hyper-parameters, calibration and threshold from CV scores only
+ └─ 3. refit the whole Pipeline on all development data
+ └─ 4. test set: transform + predict ONCE → report with confidence intervals
+ └─ 5. inference: the same fitted Pipeline, transform only
+```
+
+In code, put every step that learns statistics inside one `sklearn` or `imblearn` `Pipeline`. Then `GridSearchCV`, `cross_val_score` and `CalibratedClassifierCV` refit it inside every fold automatically, which removes L1, L6 and L7 by construction. Select on CV rather than the test set (L2), keep stacking and threshold data separate (L3, L5), and never pass test rows to CV (L4). `05_reference_pipeline.py` follows this order.
+
+---
+
+## 5. Modelling, selection and evaluation
 
 | ID | Severity | Finding | Where |
 |---|---|---|---|
@@ -184,9 +269,9 @@ Four separate problems:
 
 ---
 
-## 5. Controlled experiments
+## 6. Controlled experiments
 
-### 5.1 Ablation of preprocessing decisions
+### 6.1 Ablation of preprocessing decisions
 
 5 × 5 repeated stratified CV on all 3,390 rows, with **every fitted step inside the folds**. Values are mean ± SD over 25 folds (`03_preprocessing_ablation.py`). "Mean pred − obs" is calibration-in-the-large; 0 is perfect.
 
@@ -209,7 +294,7 @@ What the ablation shows:
 - **Resampling never helps AUC and always wrecks calibration.** Brier roughly doubles and mean risk is overstated by 29 points.
 - The bug fixes (B, C) move aggregate AUC only slightly, because the affected patients are rare. Their value shows up in the behavioural tests below.
 
-### 5.2 Shipped bundle vs reference pipeline on the repo's own test split
+### 6.2 Shipped bundle vs reference pipeline on the repo's own test split
 
 The reference pipeline is `05_reference_pipeline.py`: explicit encoding, domain-aware `cigsPerDay` imputation, median imputation with indicators, `log1p`, scaling, LR, and `CalibratedClassifierCV(cv=5)`. There is no SMOTE, clipping or filtering. It is trained on the same 80% the repo trains, tunes and calibrates on, and tested on the same 678 rows.
 
@@ -222,7 +307,7 @@ The reference pipeline is `05_reference_pipeline.py`: explicit encoding, domain-
 | Sens / Spec at 10% risk | 0.882 / 0.377 | 0.794 / 0.467 |
 | Sens / Spec at 20% risk | 0.431 / 0.835 | 0.451 / 0.851 |
 
-### 5.3 Behavioural tests (same patient, one factor changed)
+### 6.3 Behavioural tests (same patient, one factor changed)
 
 Baseline patient: 55-year-old male, non-smoker, BP 130/85, cholesterol 220, BMI 26, glucose 90.
 
@@ -241,7 +326,7 @@ This is the key point for production: **the aggregate metrics are nearly identic
 
 ---
 
-## 6. Inference and serving
+## 7. Inference and serving
 
 | ID | Severity | Finding | Evidence |
 |---|---|---|---|
@@ -258,7 +343,7 @@ This is the key point for production: **the aggregate metrics are nearly identic
 
 ---
 
-## 7. Documentation integrity
+## 8. Documentation integrity
 
 | Claim | Location | Reality |
 |---|---|---|
@@ -273,9 +358,9 @@ This is the key point for production: **the aggregate metrics are nearly identic
 
 ---
 
-## 8. How it should be built
+## 9. How it should be built
 
-### 8.1 Reference design
+### 9.1 Reference design
 
 ```python
 pipe = Pipeline([
@@ -299,7 +384,7 @@ pipe = Pipeline([
 
 A runnable version is in `05_reference_pipeline.py`.
 
-### 8.2 Production checklist
+### 9.2 Production checklist
 
 | Area | Requirement |
 |---|---|
@@ -313,7 +398,7 @@ A runnable version is in `05_reference_pipeline.py`.
 | **Monitoring** | Input drift (PSI or KS per feature), prediction-distribution drift, and calibration once outcomes arrive. Alerting and a retraining playbook. |
 | **Governance** | Model card following TRIPOD+AI. Fairness and subgroup review (sex, age band, education). Benchmark against an established clinical risk score. External validation before any clinical use. |
 
-### 8.3 Remediation plan
+### 9.3 Remediation plan
 
 **P0: before any prediction is shown to anyone**
 1. Remove the IQR clipper and the variance/correlation filters. Keep `sysBP`/`diaBP`. Remove `smoking_intensity`.
@@ -331,20 +416,21 @@ A runnable version is in `05_reference_pipeline.py`.
 **P2: make it operable**
 10. Subgroup, fairness and calibration reporting. Decide on `education`.
 11. Logging, monitoring, a model registry and versioning.
-12. Correct the docs (§7), write a model card, and run external validation.
+12. Correct the docs (§8), write a model card, and run external validation.
 
 ---
 
-## 9. Reproducing this audit
+## 10. Reproducing this audit
 
 From the repo root, after `pip install -r requirements.txt matplotlib seaborn httpx`:
 
 | Script | What it shows | Runtime |
 |---|---|---|
 | `python audit/01_data_profile.py` | Data profile, missingness patterns, consistency checks (§2) | seconds |
-| `python audit/02_inference_probe.py` | Bundle internals (fences, coefficients), API/CLI behaviour, subgroup calibration, load failure (§0, §3, §6) | seconds |
-| `python audit/03_preprocessing_ablation.py` | Ablation table (§5.1) | ~6 min |
-| `python audit/04_smote_cv_leak.py` | CV-vs-test gap from SMOTE-before-CV; bootstrap CI (§3 P9, §4 M5) | ~3 min |
-| `python audit/05_reference_pipeline.py` | Reference pipeline vs shipped bundle; behavioural tests (§5.2, §5.3) | seconds |
+| `python audit/02_inference_probe.py` | Bundle internals (fences, coefficients), API/CLI behaviour, subgroup calibration, load failure (§0, §3, §7) | seconds |
+| `python audit/03_preprocessing_ablation.py` | Ablation table (§6.1) | ~6 min |
+| `python audit/04_smote_cv_leak.py` | CV-vs-test gap from SMOTE-before-CV; bootstrap CI (§3 P9, §5 M5) | ~3 min |
+| `python audit/05_reference_pipeline.py` | Reference pipeline vs shipped bundle; behavioural tests (§6.2, §6.3) | seconds |
+| `python audit/06_leakage_check.py` | Split-first / train-only fitting trace, perturbation test, downstream leaks, notebook comparison (§4) | ~2 min |
 
 The CV-vs-test table in §3 P9 is from a clean re-run of `python src/train.py` at `3a9ce96` (scikit-learn 1.9.1, xgboost 3.2.0, imbalanced-learn 0.14.2). It matches `reports/model_comparison.csv` for every model except XGBoost (0.612 vs 0.605) and GradientBoosting (0.610 vs 0.557), which differ because of library versions.
